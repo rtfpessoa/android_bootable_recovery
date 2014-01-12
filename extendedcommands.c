@@ -1447,9 +1447,9 @@ int can_partition(const char* volume) {
 
 
 #ifdef ENABLE_LOKI
-    #define FIXED_ADVANCED_ENTRIES 8
+    #define FIXED_ADVANCED_ENTRIES 9
 #else
-    #define FIXED_ADVANCED_ENTRIES 7
+    #define FIXED_ADVANCED_ENTRIES 8
 #endif
 
 int show_advanced_menu()
@@ -1485,8 +1485,9 @@ int show_advanced_menu()
     list[4] = "report error";
     list[5] = "key test";
     list[6] = "show log";
+    list[7] = "resize system";
 #ifdef ENABLE_LOKI
-    list[7] = "toggle loki support";
+    list[8] = "toggle loki support";
 #endif
 
     char list_prefix[] = "partition ";
@@ -1571,8 +1572,11 @@ int show_advanced_menu()
             case 6:
                 ui_printlogtail(12);
                 break;
-#ifdef ENABLE_LOKI
             case 7:
+                openResizeSystemMenu();
+                break;
+#ifdef ENABLE_LOKI
+            case 8:
                 toggle_loki_support();
                 break;
 #endif
@@ -1803,4 +1807,40 @@ int verify_root_and_recovery() {
 
     ensure_path_unmounted("/system");
     return ret;
+}
+
+void openResizeSystemMenu() {
+    char confirm[PATH_MAX];
+    char* headers[] = { "System partition size", "", NULL };
+    char* items[] = { "300M",
+                      "400M",
+                      "500M",
+                      NULL };
+
+    int chosen_item = get_filtered_menu_selection(headers, items, 0, 0, sizeof(items) / sizeof(char*));
+    for(;;) {
+
+        if(chosen_item == GO_BACK) {
+            break;
+        }
+
+        sprintf(confirm,"Yes - adjust, after adjustment");
+        if(confirm_selection("Dangerous operation!",confirm)) {
+            ui_print("Ajusting partition...\n");
+            switch(chosen_item)
+            {
+                case 0:
+                    __system("/sbin/sh /res/partition/systempart_300.sh");
+                case 1:
+                    __system("/sbin/sh /res/partition/systempart_400.sh");
+                case 2:
+                    __system("/sbin/sh /res/partition/systempart_500.sh");
+            }
+            ui_print("Done.\n");
+            android_reboot(ANDROID_RB_RESTART2, 0, "bootloader");
+        }
+        else {
+            break;
+        }
+    }
 }
