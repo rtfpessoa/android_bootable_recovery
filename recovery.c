@@ -900,7 +900,13 @@ setup_adbd() {
 // call a clean reboot
 void reboot_main_system(int cmd, int flags, char *arg) {
     write_recovery_version();
+
+#ifdef BOARD_NATIVE_DUALBOOT
+    device_verify_root_and_recovery();
+#else
     verify_root_and_recovery();
+#endif
+
     finish_recovery(NULL); // sync() in here
     vold_unmount_all();
     android_reboot(cmd, flags, arg);
@@ -1126,7 +1132,6 @@ main(int argc, char **argv) {
         // we are starting up in user initiated recovery here
         // let's set up some default options
         signature_check_enabled = 0;
-        script_assert_enabled = 0;
         is_user_initiated_recovery = 1;
         if (!headless) {
             ui_set_show_text(1);

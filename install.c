@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <stdio.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,11 +33,12 @@
 #include "mtdutils/mtdutils.h"
 #include "roots.h"
 #include "verifier.h"
+#include "recovery_ui.h"
 
 #include "firmware.h"
 
 #include "extendedcommands.h"
-
+#include "propsrvc/legacy_property_service.h"
 
 #define ASSUMED_UPDATE_BINARY_NAME  "META-INF/com/google/android/update-binary"
 #define ASSUMED_UPDATE_SCRIPT_NAME  "META-INF/com/google/android/update-script"
@@ -104,10 +106,54 @@ handle_firmware_update(char* type, char* filename, ZipArchive* zip) {
 }
 
 static const char *LAST_INSTALL_FILE = "/cache/recovery/last_install";
+static const char *DEV_PROP_PATH = "/dev/__properties__";
+static const char *DEV_PROP_BACKUP_PATH = "/dev/__properties_backup__";
+static bool legacy_props_env_initd = false;
+static bool legacy_props_path_modified = false;
+
+static int set_legacy_props() {
+    if (!legacy_props_env_initd) {
+        if (legacy_properties_init() != 0)
+            return -1;
+
+        char tmp[32];
+        int propfd, propsz;
+        legacy_get_property_workspace(&propfd, &propsz);
+        sprintf(tmp, "%d,%d", dup(propfd), propsz);
+        setenv("ANDROID_PROPERTY_WORKSPACE", tmp, 1);
+        legacy_props_env_initd = true;
+    }
+
+    if (rename(DEV_PROP_PATH, DEV_PROP_BACKUP_PATH) != 0) {
+        LOGE("Could not rename properties path: %s\n", DEV_PROP_PATH);
+        return -1;
+    } else {
+        legacy_props_path_modified = true;
+    }
+
+    return 0;
+}
+
+static int unset_legacy_props() {
+    if (rename(DEV_PROP_BACKUP_PATH, DEV_PROP_PATH) != 0) {
+        LOGE("Could not rename properties path: %s\n", DEV_PROP_BACKUP_PATH);
+        return -1;
+    } else {
+        legacy_props_path_modified = false;
+    }
+
+    return 0;
+}
 
 // If the package contains an update binary, extract it and run it.
 static int
 try_update_binary(const char *path, ZipArchive *zip) {
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+	int rc;
+	if((rc=device_truedualboot_before_update(path, zip))!=0)
+		return rc;
+#endif
+
     const ZipEntry* binary_entry =
             mzFindZipEntry(zip, ASSUMED_UPDATE_BINARY_NAME);
     if (binary_entry == NULL) {
@@ -145,14 +191,10 @@ try_update_binary(const char *path, ZipArchive *zip) {
     /* Make sure the update binary is compatible with this recovery
      *
      * We're building this against 4.4's (or above) bionic, which
-     * has a different property namespace structure. Old updaters
-     * don't know how to deal with it, so if we think we got one
-     * of those, force the use of a fallback compatible copy and
-     * hope for the best
-     *
-     * if "set_perm_" is found, it's probably a regular updater
-     * instead of a custom one. And if "set_metadata_" isn't there,
-     * it's pre-4.4, which makes it incompatible
+     * has a different property namespace structure. If "set_perm_"
+     * is found, it's probably a regular updater instead of a custom
+     * one. If "set_metadata_" isn't there, it's pre-4.4, which
+     * makes it incompatible.
      *
      * Also, I hate matching strings in binary blobs */
 
@@ -160,7 +202,7 @@ try_update_binary(const char *path, ZipArchive *zip) {
     char tmpbuf;
     char setpermmatch[9] = { 's','e','t','_','p','e','r','m','_' };
     char setmetamatch[13] = { 's','e','t','_','m','e','t','a','d','a','t','a','_' };
-    int pos = 0;
+    size_t pos = 0;
     bool foundsetperm = false;
     bool foundsetmeta = false;
 
@@ -192,20 +234,14 @@ try_update_binary(const char *path, ZipArchive *zip) {
     }
     fclose(updaterfile);
 
-    /* Found set_perm and !set_metadata, overwrite the binary with the fallback */
+    /* Set legacy properties */
     if (foundsetperm && !foundsetmeta) {
-        FILE *fallbackupdater = fopen("/res/updater.fallback", "rb");
-        FILE *updaterfile = fopen(binary, "wb");
-        char updbuf[1024];
-
-        LOGW("Using fallback updater for downgrade...\n");
-        while (!feof(fallbackupdater)) {
-           fread(&updbuf, 1, 1024, fallbackupdater);
-           fwrite(&updbuf, 1, 1024, updaterfile);
+        LOGI("Using legacy property environment for update-binary...\n");
+        if (set_legacy_props() != 0) {
+            LOGE("Legacy property environment did not init successfully. Properties may not be detected.\n");
+        } else {
+            LOGI("Legacy property environment initialized.\n");
         }
-        chmod(binary, 0755);
-        fclose(updaterfile);
-        fclose(fallbackupdater);
     }
 
     int pipefd[2];
@@ -257,7 +293,7 @@ try_update_binary(const char *path, ZipArchive *zip) {
     if (pid == 0) {
         setenv("UPDATE_PACKAGE", path, 1);
         close(pipefd[0]);
-        execv(binary, args);
+        execve(binary, args, environ);
         fprintf(stdout, "E:Can't run %s (%s)\n", binary, strerror(errno));
         _exit(-1);
     }
@@ -312,6 +348,16 @@ try_update_binary(const char *path, ZipArchive *zip) {
 
     int status;
     waitpid(pid, &status, 0);
+
+    /* Unset legacy properties */
+    if (legacy_props_path_modified) {
+        if (unset_legacy_props() != 0) {
+            LOGE("Legacy property environment did not disable successfully. Legacy properties may still be in use.\n");
+        } else {
+            LOGI("Legacy property environment disabled.\n");
+        }
+    }
+
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         LOGE("Error in %s\n(Status %d)\n", path, WEXITSTATUS(status));
         mzCloseZipArchive(zip);
@@ -330,13 +376,9 @@ try_update_binary(const char *path, ZipArchive *zip) {
 static int
 really_install_package(const char *path)
 {
-    int ret = 0;
-
     ui_set_background(BACKGROUND_ICON_INSTALLING);
     ui_print("Finding update package...\n");
     ui_show_indeterminate_progress();
-
-    set_perf_mode(1);
 
     // Resolve symlink in case legacy /sdcard path is used
     // Requires: symlink uses absolute path
@@ -362,8 +404,7 @@ really_install_package(const char *path)
 
     if (ensure_path_mounted(path) != 0) {
         LOGE("Can't mount %s\n", path);
-        ret = INSTALL_CORRUPT;
-        goto out;
+        return INSTALL_CORRUPT;
     }
 
     ui_print("Opening update package...\n");
@@ -375,8 +416,7 @@ really_install_package(const char *path)
         Certificate* loadedKeys = load_keys(PUBLIC_KEYS_FILE, &numKeys);
         if (loadedKeys == NULL) {
             LOGE("Failed to load keys\n");
-            ret = INSTALL_CORRUPT;
-            goto out;
+            return INSTALL_CORRUPT;
         }
         LOGI("%d key(s) loaded from %s\n", numKeys, PUBLIC_KEYS_FILE);
 
@@ -392,10 +432,8 @@ really_install_package(const char *path)
         if (err != VERIFY_SUCCESS) {
             LOGE("signature verification failed\n");
             ui_show_text(1);
-            if (!confirm_selection("Install Untrusted Package?", "Yes - Install untrusted zip")) {
-                ret = INSTALL_CORRUPT;
-                goto out;
-            }
+            if (!confirm_selection("Install Untrusted Package?", "Yes - Install untrusted zip"))
+                return INSTALL_CORRUPT;
         }
     }
 
@@ -405,18 +443,13 @@ really_install_package(const char *path)
     err = mzOpenZipArchive(path, &zip);
     if (err != 0) {
         LOGE("Can't open %s\n(%s)\n", path, err != -1 ? strerror(err) : "bad");
-        ret = INSTALL_CORRUPT;
-        goto out;
+        return INSTALL_CORRUPT;
     }
 
     /* Verify and install the contents of the package.
      */
     ui_print("Installing update...\n");
-    ret = try_update_binary(path, &zip);
-
-out:
-    set_perf_mode(0);
-    return ret;
+    return try_update_binary(path, &zip);
 }
 
 int

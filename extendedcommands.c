@@ -47,7 +47,6 @@
 #include "adb_install.h"
 
 int signature_check_enabled = 1;
-int script_assert_enabled = 1;
 
 int get_filtered_menu_selection(const char** headers, char** items, int menu_only, int initial_selection, int items_count) {
     int index;
@@ -98,7 +97,7 @@ void write_recovery_version() {
     char path[PATH_MAX];
     sprintf(path, "%s%s%s", get_primary_storage_path(), (is_data_media() ? "/0/" : "/"), RECOVERY_VERSION_FILE);
     write_string_to_file(path, EXPAND(RECOVERY_VERSION) "\n" EXPAND(TARGET_DEVICE));
-    // force unmount /data on /data/media devices as we call this on recovery start
+    // force unmount /data for /data/media devices as we call this on recovery exit
     ignore_data_media_workaround(1);
     ensure_path_unmounted(path);
     ignore_data_media_workaround(0);
@@ -111,7 +110,7 @@ static void write_last_install_path(const char* install_path) {
 }
 
 const char* read_last_install_path() {
-    char path[PATH_MAX];
+    static char path[PATH_MAX];
     sprintf(path, "%s%s%s", get_primary_storage_path(), (is_data_media() ? "/0/" : "/"), RECOVERY_LAST_INSTALL_FILE);
 
     ensure_path_mounted(path);
@@ -211,8 +210,7 @@ int show_install_update_menu() {
         } else if (chosen_item >= FIXED_TOP_INSTALL_ZIP_MENUS && chosen_item < FIXED_TOP_INSTALL_ZIP_MENUS + num_extra_volumes) {
             show_choose_zip_menu(extra_paths[chosen_item - FIXED_TOP_INSTALL_ZIP_MENUS]);
         } else if (chosen_item == FIXED_TOP_INSTALL_ZIP_MENUS + num_extra_volumes) {
-            char *last_path_used;
-            last_path_used = read_last_install_path();
+            const char *last_path_used = read_last_install_path();
             if (last_path_used == NULL)
                 show_choose_zip_menu(primary_path);
             else
@@ -345,10 +343,7 @@ char** gather_files(const char* directory, const char* fileExtensionOrDirectory,
 
 // pass in NULL for fileExtensionOrDirectory and you will get a directory chooser
 char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory, const char* headers[]) {
-    static const char* fixed_headers[20];
-    char path[PATH_MAX] = "";
-    DIR *dir;
-    struct dirent *de;
+    const char* fixed_headers[20];
     int numFiles = 0;
     int numDirs = 0;
     int i;
@@ -358,16 +353,12 @@ char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory
 
     strcpy(directory, basedir);
 
-    // Append a traiing slash if necessary
+    // Append a trailing slash if necessary
     if (directory[dir_len - 1] != '/') {
         strcat(directory, "/");
         dir_len++;
     }
 
-    i = 0;
-    while (headers[i]) {
-        i++;
-    }
     i = 0;
     while (headers[i]) {
         fixed_headers[i] = headers[i];
@@ -401,19 +392,16 @@ char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory
             int chosen_item = get_menu_selection(fixed_headers, list, 0, 0);
             if (chosen_item == GO_BACK || chosen_item == REFRESH)
                 break;
-            char ret[PATH_MAX];
             if (chosen_item < numDirs) {
                 char* subret = choose_file_menu(dirs[chosen_item], fileExtensionOrDirectory, headers);
                 if (subret != NULL) {
-                    strcpy(ret, subret);
-                    return_value = strdup(ret);
+                    return_value = strdup(subret);
                     free(subret);
                     break;
                 }
                 continue;
             }
-            strcpy(ret, files[chosen_item - numDirs]);
-            return_value = strdup(ret);
+            return_value = strdup(files[chosen_item - numDirs]);
             break;
         }
         free_string_array(list);
@@ -435,11 +423,10 @@ void show_choose_zip_menu(const char *mount_point) {
     char* file = choose_file_menu(mount_point, ".zip", headers);
     if (file == NULL)
         return;
-    static char* confirm_install = "Confirm install?";
-    static char confirm[PATH_MAX];
+    char confirm[PATH_MAX];
     sprintf(confirm, "Yes - Install %s", basename(file));
 
-    if (confirm_selection(confirm_install, confirm)) {
+    if (confirm_selection("Confirm install?", confirm)) {
         install_zip(file);
         write_last_install_path(dirname(file));
     }
@@ -482,7 +469,6 @@ void show_nandroid_delete_menu(const char* path) {
         return;
 
     if (confirm_selection("Confirm delete?", "Yes - Delete")) {
-        // nandroid_restore(file, 1, 1, 1, 1, 1, 0);
         sprintf(tmp, "rm -rf %s", file);
         __system(tmp);
     }
@@ -543,6 +529,12 @@ int confirm_selection(const char* title, const char* confirm) {
     if (0 == stat(path, &info))
         return 1;
 
+#ifdef BOARD_NATIVE_DUALBOOT
+    char buf[PATH_MAX];
+    device_build_selection_title(buf, title);
+    title = (char*)&buf;
+#endif
+
     int many_confirm;
     char* confirm_str = strdup(confirm);
     const char* confirm_headers[] = { title, "  THIS CAN NOT BE UNDONE.", "", NULL };
@@ -584,6 +576,10 @@ extern void reset_ext4fs_info();
 
 extern struct selabel_handle *sehandle;
 int format_device(const char *device, const char *path, const char *fs_type) {
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+    if(device_truedualboot_format_device(device, path, fs_type) <= 0)
+        return 0;
+#endif
     if (is_data_media_volume_path(path)) {
         return format_unknown_device(NULL, path, NULL);
     }
@@ -748,10 +744,6 @@ int format_unknown_device(const char *device, const char* path, const char *fs_t
     return 0;
 }
 
-//#define MOUNTABLE_COUNT 5
-//#define DEVICE_COUNT 4
-//#define MMC_COUNT 2
-
 typedef struct {
     char mount[255];
     char unmount[255];
@@ -764,20 +756,75 @@ typedef struct {
     char type[255];
 } FormatMenuEntry;
 
-int is_safe_to_format(char* name) {
-    char str[255];
-    char* partition;
-    property_get("ro.cwm.forbid_format", str, "/misc,/radio,/bootloader,/recovery,/efs,/wimax");
+typedef struct {
+    char *name;
+    int can_mount;
+    int can_format;
+} MFMatrix;
 
-    partition = strtok(str, ", ");
-    while (partition != NULL) {
-        if (strcmp(name, partition) == 0) {
-            return 0;
+MFMatrix get_mnt_fmt_capabilities(char *fs_type, char *mount_point) {
+    MFMatrix mfm = { mount_point, 1, 1 };
+
+    const int NUM_FS_TYPES = 5;
+    MFMatrix *fs_matrix = malloc(NUM_FS_TYPES * sizeof(MFMatrix));
+    // Defined capabilities:   fs_type     mnt fmt
+    fs_matrix[0] = (MFMatrix){ "bml",       0,  1 };
+    fs_matrix[1] = (MFMatrix){ "datamedia", 0,  1 };
+    fs_matrix[2] = (MFMatrix){ "emmc",      0,  1 };
+    fs_matrix[3] = (MFMatrix){ "mtd",       0,  0 };
+    fs_matrix[4] = (MFMatrix){ "ramdisk",   0,  0 };
+
+    const int NUM_MNT_PNTS = 6;
+    MFMatrix *mp_matrix = malloc(NUM_MNT_PNTS * sizeof(MFMatrix));
+    // Defined capabilities:   mount_point   mnt fmt
+    mp_matrix[0] = (MFMatrix){ "/misc",       0,  0 };
+    mp_matrix[1] = (MFMatrix){ "/radio",      0,  0 };
+    mp_matrix[2] = (MFMatrix){ "/bootloader", 0,  0 };
+    mp_matrix[3] = (MFMatrix){ "/recovery",   0,  0 };
+    mp_matrix[4] = (MFMatrix){ "/efs",        0,  0 };
+    mp_matrix[5] = (MFMatrix){ "/wimax",      0,  0 };
+
+    int i;
+    for (i = 0; i < NUM_FS_TYPES; i++) {
+        if (strcmp(fs_type, fs_matrix[i].name) == 0) {
+            mfm.can_mount = fs_matrix[i].can_mount;
+            mfm.can_format = fs_matrix[i].can_format;
         }
-        partition = strtok(NULL, ", ");
+    }
+    for (i = 0; i < NUM_MNT_PNTS; i++) {
+        if (strcmp(mount_point, mp_matrix[i].name) == 0) {
+            mfm.can_mount = mp_matrix[i].can_mount;
+            mfm.can_format = mp_matrix[i].can_format;
+        }
     }
 
-    return 1;
+    free(fs_matrix);
+    free(mp_matrix);
+
+    // User-defined capabilities
+    char *custom_mp;
+    char custom_forbidden_mount[PROPERTY_VALUE_MAX];
+    char custom_forbidden_format[PROPERTY_VALUE_MAX];
+    property_get("ro.cwm.forbid_mount", custom_forbidden_mount, "");
+    property_get("ro.cwm.forbid_format", custom_forbidden_format, "");
+
+    custom_mp = strtok(custom_forbidden_mount, ",");
+    while (custom_mp != NULL) {
+        if (strcmp(mount_point, custom_mp) == 0) {
+            mfm.can_mount = 0;
+        }
+        custom_mp = strtok(NULL, ",");
+    }
+
+    custom_mp = strtok(custom_forbidden_format, ",");
+    while (custom_mp != NULL) {
+        if (strcmp(mount_point, custom_mp) == 0) {
+            mfm.can_format = 0;
+        }
+        custom_mp = strtok(NULL, ",");
+    }
+
+    return mfm;
 }
 
 int show_partition_menu() {
@@ -813,20 +860,15 @@ int show_partition_menu() {
             continue;
         }
 
-        if (strcmp("ramdisk", v->fs_type) != 0 && strcmp("mtd", v->fs_type) != 0 && strcmp("emmc", v->fs_type) != 0 && strcmp("bml", v->fs_type) != 0) {
-            if (strcmp("datamedia", v->fs_type) != 0) {
-                sprintf(mount_menu[mountable_volumes].mount, "mount %s", v->mount_point);
-                sprintf(mount_menu[mountable_volumes].unmount, "unmount %s", v->mount_point);
-                sprintf(mount_menu[mountable_volumes].path, "%s", v->mount_point);
-                ++mountable_volumes;
-            }
-            if (is_safe_to_format(v->mount_point)) {
-                sprintf(format_menu[formatable_volumes].txt, "format %s", v->mount_point);
-                sprintf(format_menu[formatable_volumes].path, "%s", v->mount_point);
-                sprintf(format_menu[formatable_volumes].type, "%s", v->fs_type);
-                ++formatable_volumes;
-            }
-        } else if (strcmp("ramdisk", v->fs_type) != 0 && strcmp("mtd", v->fs_type) == 0 && is_safe_to_format(v->mount_point)) {
+        MFMatrix mfm = get_mnt_fmt_capabilities(v->fs_type, v->mount_point);
+
+        if (mfm.can_mount) {
+            sprintf(mount_menu[mountable_volumes].mount, "mount %s", v->mount_point);
+            sprintf(mount_menu[mountable_volumes].unmount, "unmount %s", v->mount_point);
+            sprintf(mount_menu[mountable_volumes].path, "%s", v->mount_point);
+            ++mountable_volumes;
+        }
+        if (mfm.can_format) {
             sprintf(format_menu[formatable_volumes].txt, "format %s", v->mount_point);
             sprintf(format_menu[formatable_volumes].path, "%s", v->mount_point);
             sprintf(format_menu[formatable_volumes].type, "%s", v->fs_type);
@@ -1193,7 +1235,7 @@ void format_sdcard(const char* volume) {
     if (!fs_mgr_is_voldmanaged(v) && !can_partition(volume))
         return;
 
-    char* headers[] = { "Format device:", volume, "", NULL };
+    const char* headers[] = { "Format device:", volume, "", NULL };
 
     static char* list[] = { "default",
                             "vfat",
@@ -1256,7 +1298,7 @@ void format_sdcard(const char* volume) {
         ui_print("Done formatting %s (%s)\n", volume, list[chosen_item]);
 }
 
-static void partition_sdcard(const char* volume) {
+void partition_sdcard(const char* volume) {
     if (!can_partition(volume)) {
         ui_print("Can't partition device: %s\n", volume);
         return;
@@ -1355,14 +1397,26 @@ int can_partition(const char* volume) {
 
 
 #ifdef ENABLE_LOKI
+
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+#define FIXED_ADVANCED_ENTRIES 11
+#else
 #define FIXED_ADVANCED_ENTRIES 9
+#endif
+
+#else
+
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+#define FIXED_ADVANCED_ENTRIES 10
 #else
 #define FIXED_ADVANCED_ENTRIES 8
 #endif
 
+#endif
+
 int show_advanced_menu() {
     char buf[80];
-    int i = 0, j = 0, chosen_item = 0;
+    int i = 0, j = 0, chosen_item = 0, list_index = 0;
     /* Default number of entries if no compile-time extras are added */
     static char* list[MAX_NUM_MANAGED_VOLUMES + FIXED_ADVANCED_ENTRIES + 1];
 
@@ -1374,24 +1428,29 @@ int show_advanced_menu() {
 
     memset(list, 0, MAX_NUM_MANAGED_VOLUMES + FIXED_ADVANCED_ENTRIES + 1);
 
-    list[0] = "reboot recovery";
+    list[list_index++] = "reboot recovery";
 
     char bootloader_mode[PROPERTY_VALUE_MAX];
     property_get("ro.bootloader.mode", bootloader_mode, "");
     if (!strcmp(bootloader_mode, "download")) {
-        list[1] = "reboot to download mode";
+        list[list_index++] = "reboot to download mode";
     } else {
-        list[1] = "reboot to bootloader";
+        list[list_index++] = "reboot to bootloader";
     }
 
-    list[2] = "power off";
-    list[3] = "wipe dalvik cache";
-    list[4] = "report error";
-    list[5] = "key test";
-    list[6] = "show log";
-    list[7] = "resize system";
+    list[list_index++] = "power off";
+    list[list_index++] = "wipe dalvik cache";
+    list[list_index++] = "report error";
+    list[list_index++] = "key test";
+    list[list_index++] = "show log";
+    list[list_index++] = "resize system";
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+    int index_tdb = list_index++;
+    int index_bootmode = list_index++;
+#endif
 #ifdef ENABLE_LOKI
-    list[8] = "toggle loki support";
+    int index_loki = list_index++;
+    list[index_loki] = "toggle loki support";
 #endif
 
     char list_prefix[] = "partition ";
@@ -1413,6 +1472,15 @@ int show_advanced_menu() {
     list[FIXED_ADVANCED_ENTRIES + j] = NULL;
 
     for (;;) {
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+        char tdb_name[PATH_MAX];
+        device_get_truedualboot_entry(tdb_name);
+        list[index_tdb] = &tdb_name;
+
+        char bootmode_name[PATH_MAX];
+        device_get_bootmode(bootmode_name);
+        list[index_bootmode] = &bootmode_name;
+#endif
         chosen_item = get_filtered_menu_selection(headers, list, 0, 0, sizeof(list) / sizeof(char*));
         if (chosen_item == GO_BACK || chosen_item == REFRESH)
             break;
@@ -1473,14 +1541,25 @@ int show_advanced_menu() {
             case 7:
                 openResizeSystemMenu();
                 break;
+            default:
+#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
+            if(chosen_item==index_tdb) {
+                device_toggle_truedualboot();
+                break;
+            }
+            if(chosen_item==index_bootmode) {
+                device_choose_bootmode();
+                break;
+            }
+#endif
 #ifdef ENABLE_LOKI
-            case 8:
+            if(chosen_item==index_loki) {
                 toggle_loki_support();
                 break;
+            }
 #endif
-            default:
-                partition_sdcard(list[chosen_item] + strlen(list_prefix));
-                break;
+            partition_sdcard(list[chosen_item] + strlen(list_prefix));
+            break;
         }
     }
 
@@ -1736,7 +1815,7 @@ void openResizeSystemMenu() {
                     __system("/sbin/sh /res/partition/systempart_500.sh");
             }
             ui_print("Done.\n");
-            android_reboot(ANDROID_RB_RESTART2, 0, "bootloader");
+            android_reboot(ANDROID_RB_RESTART, 0, "reboot");
         }
         else {
             break;
