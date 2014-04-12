@@ -1815,7 +1815,7 @@ void openResizeSystemMenu() {
                     __system("/sbin/sh /res/partition/systempart_500.sh");
             }
             ui_print("Done.\n");
-            android_reboot(ANDROID_RB_RESTART, 0, "reboot");
+            reboot_main_system(ANDROID_RB_RESTART2, 0, "recovery");
         }
         else {
             break;
