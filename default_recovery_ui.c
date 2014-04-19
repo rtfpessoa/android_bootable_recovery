@@ -22,13 +22,13 @@
 
 char* MENU_HEADERS[] = { NULL };
 
-char* MENU_ITEMS[] = { "reboot system now",
-                       "install zip",
-                       "wipe data/factory reset",
-                       "wipe cache partition",
-                       "backup and restore",
-                       "mounts and storage",
-                       "advanced",
+char* MENU_ITEMS[] = { "立即重启",
+                       "安装zip",
+                       "清除数据/恢复出厂设置",
+                       "清除缓存分区",
+                       "备份和恢复",
+                       "挂载和存储",
+                       "高级设置",
                        NULL };
 
 void device_ui_init(UIParameters* ui_parameters) {
