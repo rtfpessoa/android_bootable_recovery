@@ -29,13 +29,6 @@ extern int device_recovery_start();
 
 // Called in the input thread when a new key (key_code) is pressed.
 // *key_pressed is an array of KEY_MAX+1 bytes indicating which other
-// keys are already pressed.  Return true if the text display should
-// be toggled.
-extern int device_toggle_display(volatile char* key_pressed, int key_code);
-int get_allow_toggle_display();
-
-// Called in the input thread when a new key (key_code) is pressed.
-// *key_pressed is an array of KEY_MAX+1 bytes indicating which other
 // keys are already pressed.  Return true if the device should reboot
 // immediately.
 extern int device_reboot_now(volatile char* key_pressed, int key_code);
@@ -130,15 +123,12 @@ extern char* MENU_ITEMS[];
 // Loosely track the depth of the current menu
 extern int ui_root_menu;
 
-int
-get_menu_selection(const char** headers, char** items, int menu_only, int initial_selection);
+int get_menu_selection(const char** headers, char** items, int menu_only, int initial_selection);
 
-void
-set_sdcard_update_bootloader_message();
+void set_sdcard_update_bootloader_message();
 
 extern int ui_handle_key(int key, int visible);
 
-// call a clean reboot
 void reboot_main_system(int cmd, int flags, char *arg);
 
 #endif

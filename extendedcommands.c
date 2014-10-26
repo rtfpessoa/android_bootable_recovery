@@ -1,54 +1,112 @@
+/*
+ * Copyright (C) 2014 The CyanogenMod Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <libgen.h>
 #include <limits.h>
 #include <linux/input.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/limits.h>
 #include <sys/reboot.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <sys/wait.h>
-#include <sys/limits.h>
-#include <dirent.h>
-#include <sys/stat.h>
-
-#include <signal.h>
-#include <sys/wait.h>
-
+#include "adb_install.h"
+#include "bmlutils/bmlutils.h"
 #include "bootloader.h"
 #include "common.h"
+#include "cutils/android_reboot.h"
 #include "cutils/properties.h"
+#include "edify/expr.h"
+#include "extendedcommands.h"
 #include "firmware.h"
+#include "flashutils/flashutils.h"
 #include "install.h"
 #include "make_ext4fs.h"
 #include "minui/minui.h"
 #include "minzip/DirUtil.h"
-#include "roots.h"
-#include "recovery_ui.h"
-
-#include "extendedcommands.h"
-#include "recovery_settings.h"
-#include "nandroid.h"
-#include "mounts.h"
-#include "flashutils/flashutils.h"
-#include "edify/expr.h"
-#include <libgen.h>
-#include "mtdutils/mtdutils.h"
-#include "bmlutils/bmlutils.h"
-#include "cutils/android_reboot.h"
 #include "mmcutils/mmcutils.h"
+#include "mounts.h"
+#include "mtdutils/mtdutils.h"
+#include "nandroid.h"
+#include "recovery_settings.h"
+#include "recovery_ui.h"
+#include "roots.h"
 #include "voldclient/voldclient.h"
 
-#include "adb_install.h"
+// top fixed menu items, those before extra storage volumes
+#define FIXED_TOP_INSTALL_ZIP_MENUS 1
+// bottom fixed menu items, those after extra storage volumes
+#define FIXED_BOTTOM_INSTALL_ZIP_MENUS 3
+#define FIXED_INSTALL_ZIP_MENUS (FIXED_TOP_INSTALL_ZIP_MENUS + FIXED_BOTTOM_INSTALL_ZIP_MENUS)
 
+// number of actions added for each volume by add_nandroid_options_for_volume()
+// these go on top of menu list
+#define NANDROID_ACTIONS_NUM 4
+// number of fixed bottom entries after volume actions
+#define NANDROID_FIXED_ENTRIES 2
+
+#if defined(ENABLE_LOKI) && defined(BOARD_NATIVE_DUALBOOT_SINGLEDATA)
+#define FIXED_ADVANCED_ENTRIES 10
+#elif !defined(ENABLE_LOKI) && defined(BOARD_NATIVE_DUALBOOT_SINGLEDATA)
+#define FIXED_ADVANCED_ENTRIES 9
+#elif defined(ENABLE_LOKI) && !defined(BOARD_NATIVE_DUALBOOT_SINGLEDATA)
+#define FIXED_ADVANCED_ENTRIES 8
+#else
+#define FIXED_ADVANCED_ENTRIES 7
+#endif
+
+extern struct selabel_handle *sehandle;
 int signature_check_enabled = 1;
 
-int get_filtered_menu_selection(const char** headers, char** items, int menu_only, int initial_selection, int items_count) {
+typedef struct {
+    char mount[255];
+    char unmount[255];
+    char path[PATH_MAX];
+} MountMenuEntry;
+
+typedef struct {
+    char txt[255];
+    char path[PATH_MAX];
+    char type[255];
+} FormatMenuEntry;
+
+typedef struct {
+    char *name;
+    int can_mount;
+    int can_format;
+} MFMatrix;
+
+// Prototypes of private functions that are used before defined
+static void show_choose_zip_menu(const char *mount_point);
+static void format_sdcard(const char* volume);
+static int can_partition(const char* volume);
+static int is_path_mounted(const char* path);
+
+static int get_filtered_menu_selection(const char** headers, char** items, int menu_only, int initial_selection, int items_count) {
     int index;
     int offset = 0;
     int* translate_table = (int*)malloc(sizeof(int) * items_count);
@@ -81,7 +139,7 @@ int get_filtered_menu_selection(const char** headers, char** items, int menu_onl
     return ret;
 }
 
-void write_string_to_file(const char* filename, const char* string) {
+static void write_string_to_file(const char* filename, const char* string) {
     ensure_path_mounted(filename);
     char tmp[PATH_MAX];
     sprintf(tmp, "mkdir -p $(dirname %s)", filename);
@@ -98,9 +156,9 @@ void write_recovery_version() {
     sprintf(path, "%s%s%s", get_primary_storage_path(), (is_data_media() ? "/0/" : "/"), RECOVERY_VERSION_FILE);
     write_string_to_file(path, EXPAND(RECOVERY_VERSION) "\n" EXPAND(TARGET_DEVICE));
     // force unmount /data for /data/media devices as we call this on recovery exit
-    ignore_data_media_workaround(1);
+    preserve_data_media(0);
     ensure_path_unmounted(path);
-    ignore_data_media_workaround(0);
+    preserve_data_media(1);
 }
 
 static void write_last_install_path(const char* install_path) {
@@ -109,7 +167,7 @@ static void write_last_install_path(const char* install_path) {
     write_string_to_file(path, install_path);
 }
 
-const char* read_last_install_path() {
+static char* read_last_install_path() {
     static char path[PATH_MAX];
     sprintf(path, "%s%s%s", get_primary_storage_path(), (is_data_media() ? "/0/" : "/"), RECOVERY_LAST_INSTALL_FILE);
 
@@ -124,7 +182,7 @@ const char* read_last_install_path() {
     return NULL;
 }
 
-void toggle_signature_check() {
+static void toggle_signature_check() {
     signature_check_enabled = !signature_check_enabled;
     ui_print("Signature Check: %s\n", signature_check_enabled ? "Enabled" : "Disabled");
 }
@@ -161,16 +219,10 @@ int install_zip(const char* packagefilepath) {
     }
 #endif
 
-    ui_set_background(BACKGROUND_ICON_NONE);
+    ui_set_background(BACKGROUND_ICON_CLOCKWORK);
     ui_print("\nInstall from sdcard complete.\n");
     return 0;
 }
-
-// top fixed menu items, those before extra storage volumes
-#define FIXED_TOP_INSTALL_ZIP_MENUS 1
-// bottom fixed menu items, those after extra storage volumes
-#define FIXED_BOTTOM_INSTALL_ZIP_MENUS 3
-#define FIXED_INSTALL_ZIP_MENUS (FIXED_TOP_INSTALL_ZIP_MENUS + FIXED_BOTTOM_INSTALL_ZIP_MENUS)
 
 int show_install_update_menu() {
     char buf[100];
@@ -210,7 +262,7 @@ int show_install_update_menu() {
         } else if (chosen_item >= FIXED_TOP_INSTALL_ZIP_MENUS && chosen_item < FIXED_TOP_INSTALL_ZIP_MENUS + num_extra_volumes) {
             show_choose_zip_menu(extra_paths[chosen_item - FIXED_TOP_INSTALL_ZIP_MENUS]);
         } else if (chosen_item == FIXED_TOP_INSTALL_ZIP_MENUS + num_extra_volumes) {
-            const char *last_path_used = read_last_install_path();
+            char *last_path_used = read_last_install_path();
             if (last_path_used == NULL)
                 show_choose_zip_menu(primary_path);
             else
@@ -225,7 +277,6 @@ int show_install_update_menu() {
         }
     }
 out:
-    // free all the dynamic items
     free(install_menu_items[0]);
     if (extra_paths != NULL) {
         for (i = 0; i < num_extra_volumes; i++)
@@ -234,7 +285,8 @@ out:
     return chosen_item;
 }
 
-void free_string_array(char** array) {
+
+static void free_string_array(char** array) {
     if (array == NULL)
         return;
     char* cursor = array[0];
@@ -246,7 +298,7 @@ void free_string_array(char** array) {
     free(array);
 }
 
-char** gather_files(const char* directory, const char* fileExtensionOrDirectory, int* numFiles) {
+static char** gather_files(const char* directory, const char* fileExtensionOrDirectory, int* numFiles) {
     char path[PATH_MAX] = "";
     DIR *dir;
     struct dirent *de;
@@ -342,7 +394,7 @@ char** gather_files(const char* directory, const char* fileExtensionOrDirectory,
 }
 
 // pass in NULL for fileExtensionOrDirectory and you will get a directory chooser
-char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory, const char* headers[]) {
+static char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory, const char* headers[]) {
     const char* fixed_headers[20];
     int numFiles = 0;
     int numDirs = 0;
@@ -412,7 +464,7 @@ char* choose_file_menu(const char* basedir, const char* fileExtensionOrDirectory
     return return_value;
 }
 
-void show_choose_zip_menu(const char *mount_point) {
+static void show_choose_zip_menu(const char *mount_point) {
     if (ensure_path_mounted(mount_point) != 0) {
         LOGE("Can't mount %s\n", mount_point);
         return;
@@ -434,7 +486,7 @@ void show_choose_zip_menu(const char *mount_point) {
     free(file);
 }
 
-void show_nandroid_restore_menu(const char* path) {
+static void show_nandroid_restore_menu(const char* path) {
     if (ensure_path_mounted(path) != 0) {
         LOGE("Can't mount %s\n", path);
         return;
@@ -448,13 +500,16 @@ void show_nandroid_restore_menu(const char* path) {
     if (file == NULL)
         return;
 
-    if (confirm_selection("Confirm restore?", "Yes - Restore"))
-        nandroid_restore(file, 1, 1, 1, 1, 1, 0);
+    if (confirm_selection("Confirm restore?", "Yes - Restore")) {
+        unsigned char flags = NANDROID_BOOT | NANDROID_SYSTEM | NANDROID_DATA
+                              | NANDROID_CACHE | NANDROID_SDEXT;
+        nandroid_restore(file, flags);
+    }
 
     free(file);
 }
 
-void show_nandroid_delete_menu(const char* path) {
+static void show_nandroid_delete_menu(const char* path) {
     if (ensure_path_mounted(path) != 0) {
         LOGE("Can't mount %s\n", path);
         return;
@@ -495,7 +550,7 @@ static int control_usb_storage(bool on) {
     return num;
 }
 
-void show_mount_usb_storage_menu() {
+static void show_mount_usb_storage_menu() {
     // Enable USB storage using vold
     if (!control_usb_storage(true))
         return;
@@ -538,6 +593,8 @@ int confirm_selection(const char* title, const char* confirm) {
     int many_confirm;
     char* confirm_str = strdup(confirm);
     const char* confirm_headers[] = { title, "  THIS CAN NOT BE UNDONE.", "", NULL };
+    int old_val = ui_is_showing_back_button();
+    ui_set_showing_back_button(0);
 
     sprintf(path, "%s%s%s", get_primary_storage_path(), (is_data_media() ? "/0/" : "/"), RECOVERY_MANY_CONFIRM_FILE);
     ensure_path_mounted(path);
@@ -565,16 +622,12 @@ int confirm_selection(const char* title, const char* confirm) {
         int chosen_item = get_menu_selection(confirm_headers, items, 0, 0);
         ret = (chosen_item == 1);
     }
+
     free(confirm_str);
+    ui_set_showing_back_button(old_val);
     return ret;
 }
 
-#define MKE2FS_BIN      "/sbin/mke2fs"
-#define TUNE2FS_BIN     "/sbin/tune2fs"
-#define E2FSCK_BIN      "/sbin/e2fsck"
-extern void reset_ext4fs_info();
-
-extern struct selabel_handle *sehandle;
 int format_device(const char *device, const char *path, const char *fs_type) {
 #ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
     if(device_truedualboot_format_device(device, path, fs_type) <= 0)
@@ -651,7 +704,7 @@ int format_device(const char *device, const char *path, const char *fs_type) {
             // Our desired filesystem matches the one in fstab, respect v->length
             length = v->length;
         }
-        reset_ext4fs_info();
+
         int result = make_ext4fs(device, length, v->mount_point, sehandle);
         if (result != 0) {
             LOGE("format_volume: make_ext4fs failed on %s\n", device);
@@ -661,9 +714,9 @@ int format_device(const char *device, const char *path, const char *fs_type) {
     }
 #ifdef USE_F2FS
     if (strcmp(fs_type, "f2fs") == 0) {
-        int result = make_f2fs_main(device, v->mount_point);
-        if (result != 0) {
-            LOGE("format_volume: mkfs.f2f2 failed on %s\n", device);
+        char* args[] = { "mkfs.f2fs", v->blk_device };
+        if (make_f2fs_main(2, args) != 0) {
+            LOGE("format_volume: mkfs.f2fs failed on %s\n", v->blk_device);
             return -1;
         }
         return 0;
@@ -744,28 +797,10 @@ int format_unknown_device(const char *device, const char* path, const char *fs_t
     return 0;
 }
 
-typedef struct {
-    char mount[255];
-    char unmount[255];
-    char path[PATH_MAX];
-} MountMenuEntry;
-
-typedef struct {
-    char txt[255];
-    char path[PATH_MAX];
-    char type[255];
-} FormatMenuEntry;
-
-typedef struct {
-    char *name;
-    int can_mount;
-    int can_format;
-} MFMatrix;
-
-MFMatrix get_mnt_fmt_capabilities(char *fs_type, char *mount_point) {
+static MFMatrix get_mnt_fmt_capabilities(char *fs_type, char *mount_point) {
     MFMatrix mfm = { mount_point, 1, 1 };
 
-    const int NUM_FS_TYPES = 5;
+    const int NUM_FS_TYPES = 6;
     MFMatrix *fs_matrix = malloc(NUM_FS_TYPES * sizeof(MFMatrix));
     // Defined capabilities:   fs_type     mnt fmt
     fs_matrix[0] = (MFMatrix){ "bml",       0,  1 };
@@ -773,6 +808,7 @@ MFMatrix get_mnt_fmt_capabilities(char *fs_type, char *mount_point) {
     fs_matrix[2] = (MFMatrix){ "emmc",      0,  1 };
     fs_matrix[3] = (MFMatrix){ "mtd",       0,  0 };
     fs_matrix[4] = (MFMatrix){ "ramdisk",   0,  0 };
+    fs_matrix[5] = (MFMatrix){ "swap",      0,  0 };
 
     const int NUM_MNT_PNTS = 6;
     MFMatrix *mp_matrix = malloc(NUM_MNT_PNTS * sizeof(MFMatrix));
@@ -827,6 +863,28 @@ MFMatrix get_mnt_fmt_capabilities(char *fs_type, char *mount_point) {
     return mfm;
 }
 
+static int is_ums_capable() {
+    // control_usb_storage() only supports vold managed storage
+    int i;
+
+    // If USB volume is available, UMS not possible (assumes one USB/device)
+    for (i = 0; i < get_num_volumes(); i++) {
+        Volume *v = get_device_volumes() + i;
+        if (fs_mgr_is_voldmanaged(v) && vold_is_volume_available(v->mount_point)
+                && (strcasestr(v->label, "usb") || strcasestr(v->label, "otg")))
+            return 0;
+    }
+
+    // No USB storage found, look for any other vold managed storage
+    for (i = 0; i < get_num_volumes(); i++) {
+        Volume *v = get_device_volumes() + i;
+        if (fs_mgr_is_voldmanaged(v) && vold_is_volume_available(v->mount_point))
+            return 1;
+    }
+
+    return 0;
+}
+
 int show_partition_menu() {
     static const char* headers[] = { "Mounts and Storage Menu", "", NULL };
 
@@ -841,6 +899,15 @@ int show_partition_menu() {
     int i, mountable_volumes, formatable_volumes;
     int num_volumes;
     int chosen_item = 0;
+    int menu_entries = 0;
+
+    struct menu_extras {
+        int dm;   // boolean: enable wipe data media
+        int ums;  // boolean: enable mount usb mass storage
+        int idm;  // index of wipe dm entry in list[]
+        int iums; // index of ums entry in list[]
+    };
+    struct menu_extras me;
 
     num_volumes = get_num_volumes();
 
@@ -890,42 +957,33 @@ int show_partition_menu() {
             list[mountable_volumes + i] = e->txt;
         }
 
-        if (!is_data_media()) {
-            list[mountable_volumes + formatable_volumes] = "mount USB storage";
-            list[mountable_volumes + formatable_volumes + 1] = '\0';
-        } else {
-            list[mountable_volumes + formatable_volumes] = "format /data and /data/media (/sdcard)";
-            list[mountable_volumes + formatable_volumes + 1] = "mount USB storage";
-            list[mountable_volumes + formatable_volumes + 2] = '\0';
+        menu_entries = mountable_volumes + formatable_volumes;
+        me = (struct menu_extras){ 0, 0, 0, 0 };
+
+        if (me.dm = is_data_media()) {
+            me.idm = menu_entries;
+            list[me.idm] = "format /data and /data/media (/sdcard)";
+            menu_entries++;
         }
+        if (me.ums = is_ums_capable()) {
+            me.iums = menu_entries;
+            list[me.iums] = "mount USB storage";
+            menu_entries++;
+        }
+        list[menu_entries] = '\0';
 
         chosen_item = get_menu_selection(headers, list, 0, 0);
-        if (chosen_item == GO_BACK || chosen_item == REFRESH)
+        if (chosen_item >= menu_entries || chosen_item < 0)
             break;
-        if (chosen_item == (mountable_volumes + formatable_volumes)) {
-            if (!is_data_media()) {
-                show_mount_usb_storage_menu();
-            } else {
-                if (!confirm_selection("format /data and /data/media (/sdcard)", confirm))
-                    continue;
-                ignore_data_media_workaround(1);
-                ui_print("Formatting /data...\n");
-                if (0 != format_volume("/data"))
-                    ui_print("Error formatting /data!\n");
-                else
-                    ui_print("Done.\n");
-                ignore_data_media_workaround(0);
-            }
-        } else if (is_data_media() && chosen_item == (mountable_volumes + formatable_volumes + 1)) {
-            show_mount_usb_storage_menu();
-        } else if (chosen_item < mountable_volumes) {
+
+        if (chosen_item < mountable_volumes) {
             MountMenuEntry* e = &mount_menu[chosen_item];
 
             if (is_path_mounted(e->path)) {
-                ignore_data_media_workaround(1);
+                preserve_data_media(0);
                 if (0 != ensure_path_unmounted(e->path))
                     ui_print("Error unmounting %s!\n", e->path);
-                ignore_data_media_workaround(0);
+                preserve_data_media(1);
             } else {
                 if (0 != ensure_path_mounted(e->path))
                     ui_print("Error mounting %s!\n", e->path);
@@ -937,7 +995,8 @@ int show_partition_menu() {
             sprintf(confirm_string, "%s - %s", e->path, confirm_format);
 
             // support user choice fstype when formatting external storage
-            // ensure fstype==auto because most devices with internal vfat storage cannot be formatted to other types
+            // ensure fstype==auto because most devices with internal vfat
+            // storage cannot be formatted to other types
             if (strcmp(e->type, "auto") == 0) {
                 format_sdcard(e->path);
                 continue;
@@ -950,6 +1009,22 @@ int show_partition_menu() {
                 ui_print("Error formatting %s!\n", e->path);
             else
                 ui_print("Done.\n");
+        } else if (me.dm && chosen_item == me.idm) {
+            if (!confirm_selection("format /data and /data/media (/sdcard)", confirm))
+                continue;
+            preserve_data_media(0);
+            ui_print("Formatting /data...\n");
+            if (0 != format_volume("/data"))
+                ui_print("Error formatting /data!\n");
+            else
+                ui_print("Done.\n");
+            preserve_data_media(1);
+
+            // recreate /data/media with proper permissions
+            ensure_path_mounted("/data");
+            setup_data_media();
+        } else if (me.ums && chosen_item == me.iums) {
+            show_mount_usb_storage_menu();
         }
     }
 
@@ -958,7 +1033,51 @@ int show_partition_menu() {
     return chosen_item;
 }
 
-void show_nandroid_advanced_restore_menu(const char* path) {
+static void nandroid_adv_update_selections(char *str[], int listnum, unsigned char *flags) {
+    int len = strlen(str[listnum]);
+    if (str[listnum][len-2] == ' ') {
+        str[listnum][len-1] = ')';
+        str[listnum][len-2] = '+';
+        str[listnum][len-3] = '(';
+    } else {
+        str[listnum][len-1] = ' ';
+        str[listnum][len-2] = ' ';
+        str[listnum][len-3] = ' ';
+    }
+    switch(listnum) {
+        case 0:
+            *flags ^= NANDROID_BOOT;
+            break;
+        case 1:
+            *flags ^= NANDROID_SYSTEM;
+            break;
+        case 2:
+            *flags ^= NANDROID_DATA;
+            break;
+        case 3:
+            *flags ^= NANDROID_CACHE;
+            break;
+        case 4:
+            *flags ^= NANDROID_SDEXT;
+            break;
+        case 5:
+            *flags ^= NANDROID_WIMAX;
+            break;
+    }
+}
+
+int empty_nandroid_bitmask(unsigned char flags) {
+    int ret = !(((flags & NANDROID_BOOT) == NANDROID_BOOT) ||
+                ((flags & NANDROID_SYSTEM) == NANDROID_SYSTEM) ||
+                ((flags & NANDROID_DATA) == NANDROID_DATA) ||
+                ((flags & NANDROID_CACHE) == NANDROID_CACHE) ||
+                ((flags & NANDROID_SDEXT) == NANDROID_SDEXT) ||
+                ((flags & NANDROID_WIMAX) == NANDROID_WIMAX));
+
+    return ret;
+}
+
+static void show_nandroid_advanced_restore_menu(const char* path) {
     if (ensure_path_mounted(path) != 0) {
         LOGE("Can't mount sdcard\n");
         return;
@@ -978,58 +1097,63 @@ void show_nandroid_advanced_restore_menu(const char* path) {
     if (file == NULL)
         return;
 
-    static const char* headers[] = { "Advanced Restore", "", NULL };
+    static const char* headers[] = { "Advanced Restore",
+                                     "",
+                                     "Select image(s) to restore:",
+                                     NULL };
 
-    static char* list[] = { "Restore boot",
-                            "Restore system",
-                            "Restore data",
-                            "Restore cache",
-                            "Restore sd-ext",
-                            "Restore wimax",
-                            NULL };
+    int disable_wimax = 0;
+    if (0 != get_partition_device("wimax", tmp))
+        disable_wimax = 1;
 
-    if (0 != get_partition_device("wimax", tmp)) {
-        // disable wimax restore option
-        list[5] = NULL;
-    }
+    char *list[9 - disable_wimax];
+    // Dynamically allocated entries will have (+) added/removed to end
+    // Leave space at end of string  so terminator doesn't need to move
+    list[0] = malloc(sizeof("Restore boot    "));
+    list[1] = malloc(sizeof("Restore system    "));
+    list[2] = malloc(sizeof("Restore data    "));
+    list[3] = malloc(sizeof("Restore cache    "));
+    list[4] = malloc(sizeof("Restore sd-ext    "));
+    if (!disable_wimax)
+        list[5] = malloc(sizeof("Restore wimax    "));
+    list[6 - disable_wimax] = "Start restore";
+    list[7 - disable_wimax] = NULL;
 
-    static char* confirm_restore = "Confirm restore?";
+    sprintf(list[0], "Restore boot    ");
+    sprintf(list[1], "Restore system    ");
+    sprintf(list[2], "Restore data    ");
+    sprintf(list[3], "Restore cache    ");
+    sprintf(list[4], "Restore sd-ext    ");
+    if (!disable_wimax)
+        sprintf(list[5], "Restore wimax    ");
 
-    int chosen_item = get_menu_selection(headers, list, 0, 0);
-    switch (chosen_item) {
-        case 0: {
-            if (confirm_selection(confirm_restore, "Yes - Restore boot"))
-                nandroid_restore(file, 1, 0, 0, 0, 0, 0);
+    unsigned char flags = NANDROID_NONE;
+    int reload_menu;
+    int start_restore = 6-disable_wimax;
+    int chosen_item;
+
+    do {
+        reload_menu = 0;
+        chosen_item = get_menu_selection(headers, list, 0, 0);
+        if (chosen_item < 0 || chosen_item > start_restore)
             break;
+
+        if (chosen_item < start_restore) {
+            nandroid_adv_update_selections(list, chosen_item, &flags);
+        } else if ((chosen_item == start_restore) && empty_nandroid_bitmask(flags)) {
+            ui_print("No image(s) selected!\n");
+            reload_menu = 1;
         }
-        case 1: {
-            if (confirm_selection(confirm_restore, "Yes - Restore system"))
-                nandroid_restore(file, 0, 1, 0, 0, 0, 0);
-            break;
-        }
-        case 2: {
-            if (confirm_selection(confirm_restore, "Yes - Restore data"))
-                nandroid_restore(file, 0, 0, 1, 0, 0, 0);
-            break;
-        }
-        case 3: {
-            if (confirm_selection(confirm_restore, "Yes - Restore cache"))
-                nandroid_restore(file, 0, 0, 0, 1, 0, 0);
-            break;
-        }
-        case 4: {
-            if (confirm_selection(confirm_restore, "Yes - Restore sd-ext"))
-                nandroid_restore(file, 0, 0, 0, 0, 1, 0);
-            break;
-        }
-        case 5: {
-            if (confirm_selection(confirm_restore, "Yes - Restore wimax"))
-                nandroid_restore(file, 0, 0, 0, 0, 0, 1);
-            break;
-        }
-    }
+    } while ((chosen_item >=0 && chosen_item < start_restore) || reload_menu);
+
+    if (chosen_item == start_restore)
+        nandroid_restore(file, flags);
 
     free(file);
+    int i;
+    for (i = 0; i < (5-disable_wimax); i++) {
+        free(list[i]);
+    }
 }
 
 static void run_dedupe_gc() {
@@ -1116,12 +1240,6 @@ static void add_nandroid_options_for_volume(char** menu, char* path, int offset)
     sprintf(buf, "advanced restore from %s", path);
     menu[offset + 3] = strdup(buf);
 }
-
-// number of actions added for each volume by add_nandroid_options_for_volume()
-// these go on top of menu list
-#define NANDROID_ACTIONS_NUM 4
-// number of fixed bottom entries after volume actions
-#define NANDROID_FIXED_ENTRIES 2
 
 int show_nandroid_menu() {
     char* primary_path = get_primary_storage_path();
@@ -1225,7 +1343,7 @@ out:
     return chosen_item;
 }
 
-void format_sdcard(const char* volume) {
+static void format_sdcard(const char* volume) {
     if (is_data_media_volume_path(volume))
         return;
 
@@ -1277,7 +1395,14 @@ void format_sdcard(const char* volume) {
                 sprintf(cmd, "/sbin/mkntfs -f %s", v->blk_device);
                 ret = __system(cmd);
             } else if (strcmp(list[chosen_item], "ext4") == 0) {
-                ret = make_ext4fs(v->blk_device, v->length, volume, sehandle);
+                char *secontext = NULL;
+                if (selabel_lookup(sehandle, &secontext, v->mount_point, S_IFDIR) < 0) {
+                    LOGE("cannot lookup security context for %s\n", v->mount_point);
+                    ret = make_ext4fs(v->blk_device, v->length, volume, NULL);
+                } else {
+                    ret = make_ext4fs(v->blk_device, v->length, volume, sehandle);
+                    freecon(secontext);
+                }
             }
             break;
         }
@@ -1298,7 +1423,7 @@ void format_sdcard(const char* volume) {
         ui_print("Done formatting %s (%s)\n", volume, list[chosen_item]);
 }
 
-void partition_sdcard(const char* volume) {
+static void partition_sdcard(const char* volume) {
     if (!can_partition(volume)) {
         ui_print("Can't partition device: %s\n", volume);
         return;
@@ -1360,7 +1485,7 @@ void partition_sdcard(const char* volume) {
         ui_print("An error occured while partitioning your SD Card. Please see /tmp/recovery.log for more details.\n");
 }
 
-int can_partition(const char* volume) {
+static int can_partition(const char* volume) {
     if (is_data_media_volume_path(volume))
         return 0;
 
@@ -1394,25 +1519,6 @@ int can_partition(const char* volume) {
 
     return 1;
 }
-
-
-#ifdef ENABLE_LOKI
-
-#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
-#define FIXED_ADVANCED_ENTRIES 11
-#else
-#define FIXED_ADVANCED_ENTRIES 9
-#endif
-
-#else
-
-#ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
-#define FIXED_ADVANCED_ENTRIES 10
-#else
-#define FIXED_ADVANCED_ENTRIES 8
-#endif
-
-#endif
 
 int show_advanced_menu() {
     char buf[80];
@@ -1536,7 +1642,9 @@ int show_advanced_menu() {
                 break;
             }
             case 6:
-                ui_printlogtail(12);
+                ui_printlogtail(24);
+                ui_wait_key();
+                ui_clear_key_queue();
                 break;
             case 7:
                 openResizeSystemMenu();
@@ -1569,7 +1677,7 @@ int show_advanced_menu() {
     return chosen_item;
 }
 
-void write_fstab_root(char *path, FILE *file) {
+static void write_fstab_root(char *path, FILE *file) {
     Volume *vol = volume_for_path(path);
     if (vol == NULL) {
         LOGW("Unable to get recovery.fstab info for %s during fstab generation!\n", path);
@@ -1588,7 +1696,7 @@ void write_fstab_root(char *path, FILE *file) {
     fprintf(file, "%s rw\n", vol->fs_type2 != NULL && strcmp(vol->fs_type, "rfs") != 0 ? "auto" : vol->fs_type);
 }
 
-void create_fstab() {
+static void create_fstab() {
     struct stat info;
     __system("touch /etc/mtab");
     FILE *file = fopen("/etc/fstab", "w");
@@ -1611,7 +1719,7 @@ void create_fstab() {
     LOGI("Completed outputting fstab.\n");
 }
 
-int bml_check_volume(const char *path) {
+static int bml_check_volume(const char *path) {
     ui_print("Checking %s...\n", path);
     ensure_path_unmounted(path);
     if (0 == ensure_path_mounted(path)) {
@@ -1641,42 +1749,6 @@ void process_volumes() {
     }
 
     return;
-
-    // dead code.
-    if (device_flash_type() != BML)
-        return;
-
-    ui_print("Checking for ext4 partitions...\n");
-    int ret = 0;
-    ret = bml_check_volume("/system");
-    ret |= bml_check_volume("/data");
-    if (has_datadata())
-        ret |= bml_check_volume("/datadata");
-    ret |= bml_check_volume("/cache");
-
-    if (ret == 0) {
-        ui_print("Done!\n");
-        return;
-    }
-
-    char backup_path[PATH_MAX];
-    time_t t = time(NULL);
-    char backup_name[PATH_MAX];
-    struct timeval tp;
-    gettimeofday(&tp, NULL);
-    sprintf(backup_name, "before-ext4-convert-%ld", tp.tv_sec);
-    sprintf(backup_path, "%s/clockworkmod/backup/%s", get_primary_storage_path(), backup_name);
-
-    ui_set_show_text(1);
-    ui_print("Filesystems need to be converted to ext4.\n");
-    ui_print("A backup and restore will now take place.\n");
-    ui_print("If anything goes wrong, your backup will be\n");
-    ui_print("named %s. Try restoring it\n", backup_name);
-    ui_print("in case of error.\n");
-
-    nandroid_backup(backup_path);
-    nandroid_restore(backup_path, 1, 1, 1, 1, 1, 0);
-    ui_set_show_text(0);
 }
 
 void handle_failure(int ret) {
@@ -1724,10 +1796,6 @@ int verify_root_and_recovery() {
     if (ensure_path_mounted("/system") != 0)
         return 0;
 
-    // none of these options should get a "Go Back" option
-    int old_val = ui_get_showing_back_button();
-    ui_set_showing_back_button(0);
-
     int ret = 0;
     struct stat st;
     // check to see if install-recovery.sh is going to clobber recovery
@@ -1745,7 +1813,6 @@ int verify_root_and_recovery() {
             }
         }
     }
-
 
     int exists = 0;
     if (0 == lstat("/system/bin/su", &st)) {
@@ -1783,7 +1850,6 @@ int verify_root_and_recovery() {
     }
 
     ensure_path_unmounted("/system");
-    ui_set_showing_back_button(old_val);
     return ret;
 }
 

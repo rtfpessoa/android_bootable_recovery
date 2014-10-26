@@ -22,21 +22,23 @@
 #include <unistd.h>
 #include <ctype.h>
 
+#include <fs_mgr.h>
 #include "mtdutils/mtdutils.h"
 #include "mounts.h"
 #include "roots.h"
 #include "common.h"
 #include "make_ext4fs.h"
 
-#include <fs_mgr.h>
 #include <libgen.h>
-#include "flashutils/flashutils.h"
-#include "extendedcommands.h"
-#include "recovery_ui.h"
 
+#include "extendedcommands.h"
+#include "flashutils/flashutils.h"
+#include "recovery_ui.h"
 #include "voldclient/voldclient.h"
 
 static struct fstab *fstab = NULL;
+
+extern struct selabel_handle *sehandle;
 
 int get_num_volumes() {
     return fstab->num_entries;
@@ -201,8 +203,10 @@ void setup_data_media() {
             break;
         }
     }
+
+    // recreate /data/media with proper permissions
     rmdir(mount_point);
-    mkdir("/data/media", 0755);
+    mkdir("/data/media", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
     symlink("/data/media", mount_point);
 }
 
@@ -302,8 +306,6 @@ int ensure_path_mounted_at_mount_point(const char* path, const char* mount_point
     return -1;
 }
 
-static int ignore_data_media = 0;
-
 int ensure_path_unmounted(const char* path) {
 #ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
 	if(device_truedualboot_unmount(path) <= 0)
@@ -314,7 +316,7 @@ int ensure_path_unmounted(const char* path) {
     if (is_data_media_volume_path(path)) {
         return ensure_path_unmounted("/data");
     }
-    if (strstr(path, "/data") == path && is_data_media() && !ignore_data_media) {
+    if (strstr(path, "/data") == path && is_data_media() && is_data_media_preserved()) {
         return 0;
     }
 
@@ -349,8 +351,6 @@ int ensure_path_unmounted(const char* path) {
     return unmount_mounted_volume(mv);
 }
 
-extern struct selabel_handle *sehandle;
-
 int format_volume(const char* volume) {
 #ifdef BOARD_NATIVE_DUALBOOT_SINGLEDATA
     if(device_truedualboot_format_volume(volume) <= 0)
@@ -362,7 +362,7 @@ int format_volume(const char* volume) {
     }
     // check to see if /data is being formatted, and if it is /data/media
     // Note: the /sdcard check is redundant probably, just being safe.
-    if (strstr(volume, "/data") == volume && is_data_media() && !ignore_data_media) {
+    if (strstr(volume, "/data") == volume && is_data_media() && is_data_media_preserved()) {
         return format_unknown_device(NULL, volume, NULL);
     }
 
@@ -388,7 +388,13 @@ int format_volume(const char* volume) {
         if (ensure_path_unmounted(volume) != 0) {
             LOGE("format_volume failed to unmount %s", v->mount_point);
         }
-        return vold_format_volume(v->mount_point, 1) == CommandOkay ? 0 : -1;
+        if (strcmp(v->fs_type, "auto") == 0) {
+            // Format with current filesystem
+            return vold_format_volume(v->mount_point, 1) == CommandOkay ? 0 : -1;
+        } else {
+            // Format filesystem defined in fstab
+            return vold_custom_format_volume(v->mount_point, v->fs_type, 1) == CommandOkay ? 0 : -1;
+        }
     }
 
     if (strcmp(v->fs_type, "ramdisk") == 0) {
@@ -443,9 +449,8 @@ int format_volume(const char* volume) {
 
 #ifdef USE_F2FS
     if (strcmp(v->fs_type, "f2fs") == 0) {
-        const char* args[] = { "mkfs.f2fs", v->blk_device };
-        int result = make_f2fs_main(2, (char**)args);
-        if (result != 0) {
+        char* args[] = { "mkfs.f2fs", v->blk_device };
+        if (make_f2fs_main(2, args) != 0) {
             LOGE("format_volume: mkfs.f2fs failed on %s\n", v->blk_device);
             return -1;
         }
@@ -460,8 +465,13 @@ int format_volume(const char* volume) {
     return format_unknown_device(v->blk_device, volume, v->fs_type);
 }
 
-void ignore_data_media_workaround(int ignore) {
-  ignore_data_media = ignore;
+static int data_media_preserved_state = 1;
+void preserve_data_media(int val) {
+    data_media_preserved_state = val;
+}
+
+int is_data_media_preserved() {
+    return data_media_preserved_state;
 }
 
 void setup_legacy_storage_paths() {
